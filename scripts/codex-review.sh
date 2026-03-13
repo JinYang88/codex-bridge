@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # 输入：git diff 或指定文件
-# 输出：结构化 review findings（JSON 或 markdown）
+# 输出：结构化 review findings（markdown）
 #
 # 用法: codex-review.sh [workdir] [scope] [--dry-run] [--round N] [--prev-findings <file>]
 # --dry-run: 只输出 findings，不做任何修改
 # --round N: 第 N 轮 review（N>=2 时 prompt 聚焦验证修复）
 # --prev-findings <file>: 上一轮的 findings 文件（context pack forwarding）
 #
-# ⚠️  注意：codex exec 的 -o 和 stdin piping（-）标志需对照
-#    `codex exec --help` 验证。实际 CLI 版本可能有差异。
+# 环境变量:
+#   CODEX_TIMEOUT  — codex exec 超时秒数（默认 300; >10000 自动视为毫秒）
+#   CODEX_MODEL    — 指定模型（默认用 codex config 中的）
+#   MAX_DIFF_LINES — diff 最大行数（默认 1500）
+#
+# 已验证兼容 codex-cli 0.113.0+（-o, -, --sandbox read-only, --color never, -C）
 
 set -euo pipefail
 
@@ -18,7 +22,12 @@ DIFF_SCOPE="${2:-dirty}"  # dirty | staged | HEAD~1..HEAD
 DRY_RUN=false
 REVIEW_ROUND=1
 PREV_FINDINGS=""
-MAX_DIFF_LINES=2000
+MAX_DIFF_LINES="${MAX_DIFF_LINES:-1500}"
+CODEX_TIMEOUT="${CODEX_TIMEOUT:-7200}"
+# Auto-detect milliseconds vs seconds (borrowed from myclaude): >10000 treated as ms
+if [ "$CODEX_TIMEOUT" -gt 10000 ] 2>/dev/null; then
+  CODEX_TIMEOUT=$((CODEX_TIMEOUT / 1000))
+fi
 BRIDGE_DIR="$WORKDIR/.codex-bridge"
 USAGE_LOG="$BRIDGE_DIR/usage.log"
 
@@ -36,13 +45,20 @@ done
 cd "$WORKDIR"
 mkdir -p "$BRIDGE_DIR"
 
-# Portable timeout: prefer gtimeout (macOS coreutils), then timeout, then fallback
+# Portable timeout with graceful shutdown: SIGTERM first, SIGKILL after 5s
+# (inspired by myclaude's SIGTERM → wait → SIGKILL pattern)
 if command -v gtimeout >/dev/null 2>&1; then
-  TIMEOUT_CMD="gtimeout 120"
+  TIMEOUT_CMD="gtimeout --signal=TERM --kill-after=5 $CODEX_TIMEOUT"
 elif command -v timeout >/dev/null 2>&1; then
-  TIMEOUT_CMD="timeout 120"
+  TIMEOUT_CMD="timeout --signal=TERM --kill-after=5 $CODEX_TIMEOUT"
 else
   TIMEOUT_CMD=""
+fi
+
+# Model override
+CODEX_MODEL_FLAG=""
+if [ -n "${CODEX_MODEL:-}" ]; then
+  CODEX_MODEL_FLAG="-m $CODEX_MODEL"
 fi
 
 # ── Preflight secret filter ──
@@ -55,12 +71,30 @@ output_file=$(mktemp)
 error_file=$(mktemp)
 trap 'rm -f "$prompt_file" "$output_file" "$error_file"' EXIT
 
-# 收集 diff（10 行上下文）
+# 构建 git diff 参数（避免重复 case）
 case "$DIFF_SCOPE" in
-  staged)  diff_content=$(git diff -U10 --cached) ;;
-  dirty)   diff_content=$(git diff -U10) ;;
-  *)       diff_content=$(git diff -U10 "$DIFF_SCOPE") ;;
+  staged)  diff_args=(diff --cached) ;;
+  dirty)   diff_args=(diff) ;;
+  *)       diff_args=(diff "$DIFF_SCOPE") ;;
 esac
+
+# 用 --shortstat 估算改动规模（一行输出，无 locale 问题）
+# 输出格式: " 3 files changed, 120 insertions(+), 45 deletions(-)"
+raw_lines=$(git "${diff_args[@]}" --shortstat | awk '{
+  n=0; for(i=1;i<=NF;i++) if($i~/insertion|deletion/) n+=$(i-1); print n
+}')
+raw_lines=${raw_lines:-0}
+
+# 自适应上下文行数：大 diff 降低上下文，减少 prompt 体积
+# <500 改动行: -U10 | 500-1000: -U5 | >1000: -U3
+CONTEXT_LINES=10
+if [ "$raw_lines" -gt 1000 ] 2>/dev/null; then
+  CONTEXT_LINES=3
+elif [ "$raw_lines" -gt 500 ] 2>/dev/null; then
+  CONTEXT_LINES=5
+fi
+
+diff_content=$(git "${diff_args[@]}" -U${CONTEXT_LINES})
 
 # Filter out secret-bearing files from diff
 diff_content=$(printf '%s\n' "$diff_content" | awk -v pat="$SECRET_FILE_PATTERNS" '
@@ -157,16 +191,18 @@ if [ "$TRUNCATED" = true ]; then
   echo "⚠️ NOTE: This diff was truncated at a hunk boundary. There are more changes not shown." >> "$prompt_file"
 fi
 
-# 调 codex（--sandbox read-only: 沙箱只读，禁止文件修改；timeout 防挂住）
+# 调 codex（--sandbox read-only + --ephemeral 减少开销）
 $TIMEOUT_CMD codex exec \
   --sandbox read-only \
   --color never \
+  --ephemeral \
+  $CODEX_MODEL_FLAG \
   -C "$WORKDIR" \
   -o "$output_file" \
   - < "$prompt_file" >/dev/null 2>"$error_file"
 status=$?
 if [ "$status" -eq 124 ]; then
-  echo "ERROR: codex exec timed out after 120s" >&2
+  echo "ERROR: codex exec timed out after ${CODEX_TIMEOUT}s" >&2
   exit 1
 elif [ "$status" -ne 0 ]; then
   echo "ERROR: codex exec failed (exit code $status)" >&2

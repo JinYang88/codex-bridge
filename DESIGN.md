@@ -603,8 +603,8 @@ Codex CLI 原生提供 `codex review` / `codex exec review` 命令，支持 `--u
 | 风险 | 缓解 |
 |------|------|
 | Codex 的建议质量不稳定 | CC 做最终判断，不盲从；输出格式校验 + fallback |
-| codex exec 超时或挂住 | 脚本加 timeout（默认 120s） |
-| diff 太大导致 Codex 截断 | 按 hunk 边界截断（≤2000 行），截断时发出警告 |
+| codex exec 超时或挂住 | 脚本加 timeout（默认 7200s，可通过 CODEX_TIMEOUT 环境变量调整；>10000 自动视为 ms）+ --ephemeral + graceful SIGTERM→SIGKILL |
+| diff 太大导致 Codex 截断 | 自适应上下文行数（大 diff 自动降 -U3）+ 按 hunk 边界截断（≤1500 行）+ 截断警告 |
 | Codex 和 CC 无限互怼（code review） | 硬性 max 3 轮 + 收敛检测（>=50% 重叠则停止） |
 | Plan review 多轮迭代成本 | 默认 5 轮上限；每轮 Codex 调用消耗订阅额度，实际可能 2-3 轮即收敛（无新发现时提前停止）；usage.log 追踪 |
 | Debate 多轮成本 | 默认 3 轮上限；每轮含一次 Codex 调用；Codex 同意综合结论时提前停止；实际多数 debate 2 轮即收敛；usage.log 追踪 |
